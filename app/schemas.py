@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
-
 # 示例数据（行列序号均从 0 开始，与请求中的矩阵下标一致）---------------
 
 # 示例 1：3x3，4 个隐藏格构成自由块，取值为区间，不可还原。
@@ -51,8 +50,12 @@ EX_HALL_CONFLICT: dict = {
 }
 
 
-class SuppressionRequest(BaseModel):
-    """核查请求：计数矩阵（null 表示遮盖格）与公开行/列合计。"""
+class CountTable(BaseModel):
+    """计数整表：遮盖矩阵 + 行/列合计。
+
+    月报整表与核查请求共用同一遮盖矩阵和行列合计格式，因此形状、
+    类型、非负等校验集中在此基类。
+    """
 
     matrix: list[list[StrictInt | None]] = Field(
         ...,
@@ -94,7 +97,7 @@ class SuppressionRequest(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _check_shape(self) -> "SuppressionRequest":
+    def _check_shape(self) -> "CountTable":
         if not self.matrix:
             raise ValueError("matrix 至少要包含一行")
         if len(self.matrix) > 12:
@@ -114,6 +117,10 @@ class SuppressionRequest(BaseModel):
         if any(v < 0 for v in self.col_totals):
             raise ValueError("col_totals 不能包含负数")
         return self
+
+
+class SuppressionRequest(CountTable):
+    """核查请求：计数矩阵（null 表示遮盖格）与公开行/列合计。"""
 
     model_config = {
         "json_schema_extra": {
@@ -187,3 +194,125 @@ class ConflictResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: Literal["ok"]
     service: str
+
+
+# ---------------------------------------------------------------------------
+# 月报同步
+# ---------------------------------------------------------------------------
+
+# 院方首次发布：2026-09 统计月整表（遮盖矩阵 + 行列合计，沿用既有格式）
+EX_MONTHLY_PUBLISH: dict = {
+    "stat_month": "2026-09",
+    "change_type": "full_table",
+    "table": {
+        "matrix": [
+            [5, None, None],
+            [None, 3, None],
+            [None, None, 2],
+        ],
+        "row_totals": [12, 10, 8],
+        "col_totals": [9, 9, 12],
+    },
+}
+
+# 同一统计月更正：整表替换，遮盖位置与数值均可能变化
+EX_MONTHLY_CORRECTION: dict = {
+    "stat_month": "2026-09",
+    "change_type": "full_table",
+    "table": {
+        "matrix": [
+            [6, None, None],
+            [None, 3, None],
+            [None, None, 2],
+        ],
+        "row_totals": [13, 10, 8],
+        "col_totals": [9, 10, 12],
+    },
+}
+
+# 撤刊：删除本地副本，不携带整表
+EX_MONTHLY_RETRACTION: dict = {
+    "stat_month": "2026-09",
+    "change_type": "retraction",
+}
+
+
+class ReportSubmission(BaseModel):
+    """院方提交的一笔月报变更：已发布整表或撤刊通知。"""
+
+    stat_month: str = Field(
+        ...,
+        pattern=r"^\d{4}-(0[1-9]|1[0-2])$",
+        description="统计月，格式 YYYY-MM",
+    )
+    change_type: Literal["full_table", "retraction"] = Field(
+        ..., description="full_table=发布/更正整表；retraction=撤刊该月"
+    )
+    table: CountTable | None = Field(
+        default=None,
+        description=(
+            "整表内容，沿用遮盖矩阵与行/列合计格式；"
+            "full_table 必填，retraction 必须为空"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_type_table_consistency(self) -> "ReportSubmission":
+        if self.change_type == "full_table" and self.table is None:
+            raise ValueError("change_type=full_table 时必须提交 table 整表")
+        if self.change_type == "retraction" and self.table is not None:
+            raise ValueError("change_type=retraction 时不得携带 table 整表")
+        return self
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"summary": "发布/更正：提交整表（遮盖矩阵+行列合计）", "value": EX_MONTHLY_PUBLISH},
+                {"summary": "撤刊：删除该统计月本地副本", "value": EX_MONTHLY_RETRACTION},
+            ]
+        }
+    }
+
+
+class ReportChange(BaseModel):
+    """同步页中的一笔有效变更（每月已折叠为最后一笔）。"""
+
+    seq: int = Field(..., description="全局递增序号")
+    stat_month: str = Field(..., description="统计月 YYYY-MM")
+    change_type: Literal["full_table", "retraction"]
+    table: CountTable | None = Field(
+        default=None,
+        description="full_table 时为整表；retraction 时为 null，下游应删除本地副本",
+    )
+    committed_at: str = Field(..., description="入库时间（UTC ISO 8601）")
+
+
+class SubmissionResponse(BaseModel):
+    """提交成功响应（HTTP 201）。"""
+
+    seq: int = Field(..., description="本笔变更分配到的全局递增序号")
+    stat_month: str
+    change_type: Literal["full_table", "retraction"]
+    committed_at: str
+
+
+class SyncPageResponse(BaseModel):
+    """下游拉取的一页变更。"""
+
+    after_seq: int = Field(..., description="本轮起点序号（即请求游标）")
+    cutoff_seq: int = Field(
+        ...,
+        description=(
+            "本轮截止序号：取该游标首次查询时已提交的最大序号；"
+            "下一轮以它作为 after_seq"
+        ),
+    )
+    page_size: int
+    offset: int = Field(..., description="本页在轮次有效变更序列中的偏移")
+    has_more: bool = Field(..., description="本轮是否还有后续页")
+    next_page_token: str | None = Field(
+        default=None, description="续页令牌；has_more=false 时为 null"
+    )
+    changes: list[ReportChange] = Field(
+        ..., description="本页变更，按 seq 升序，每月仅保留轮次内最后一笔"
+    )

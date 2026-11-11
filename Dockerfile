@@ -15,8 +15,11 @@ COPY app ./app
 
 # 以非 root 用户运行
 RUN useradd --create-home --uid 10001 appuser \
-    && chown -R appuser:appuser /app
+    && mkdir -p /data \
+    && chown -R appuser:appuser /app /data
 USER appuser
+
+ENV SYNC_DB_PATH=/data/monthly_reports.db
 
 EXPOSE 8000
 
